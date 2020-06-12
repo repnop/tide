@@ -2,9 +2,13 @@
 
 use async_std::io;
 use async_std::net::ToSocketAddrs;
-use async_std::prelude::*;
 use async_std::sync::Arc;
 use async_std::task;
+
+use futures_channel::mpsc::channel;
+use futures_util::StreamExt;
+
+use std::sync::atomic::AtomicBool;
 
 use crate::cookies;
 use crate::log;
@@ -131,6 +135,7 @@ pub struct Server<State> {
     router: Arc<Router<State>>,
     state: Arc<State>,
     middleware: Arc<Vec<Arc<dyn Middleware<State>>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Server<()> {
@@ -197,6 +202,7 @@ impl<State: Send + Sync + 'static> Server<State> {
             router: Arc::new(Router::new()),
             middleware: Arc::new(vec![]),
             state: Arc::new(state),
+            shutdown: Arc::new(AtomicBool::new(false)),
         };
         server.middleware(cookies::CookiesMiddleware::new());
         server.middleware(log::LogMiddleware::new());
@@ -289,13 +295,32 @@ impl<State: Send + Sync + 'static> Server<State> {
         };
         log::info!("Server listening", { address: addr, target: target, tls: tls });
 
-        let mut incoming = listener.incoming();
+        let (mut tx, rx) = channel(10_000);
+        let request_tasks = task::spawn(async move {
+            rx.for_each_concurrent(None, |f| async move {
+                f.await;
+            })
+            .await;
+        });
+
+        let is_shutdown = Arc::clone(&self.shutdown);
+        let mut incoming = futures_util::StreamExt::take_until(
+            listener.incoming(),
+            futures_util::future::poll_fn(move |_| {
+                if is_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        );
+
         while let Some(stream) = incoming.next().await {
             let stream = stream?;
             let this = self.clone();
             let local_addr = stream.local_addr().ok();
             let peer_addr = stream.peer_addr().ok();
-            task::spawn(async move {
+            let _ = tx.try_send(task::spawn(async move {
                 let res = async_h1::accept(stream, |mut req| async {
                     req.set_local_addr(local_addr);
                     req.set_peer_addr(peer_addr);
@@ -308,8 +333,31 @@ impl<State: Send + Sync + 'static> Server<State> {
                 if let Err(err) = res {
                     log::error!("async-h1 error", { error: err.to_string() });
                 }
-            });
+            }));
         }
+
+        tx.close_channel();
+        listener
+            .incoming()
+            .take_until(request_tasks)
+            .for_each(|stream| async move {
+                if let Ok(stream) = stream {
+                    let local_addr = stream.local_addr().ok();
+                    let peer_addr = stream.peer_addr().ok();
+                    let res = async_h1::accept(stream, |mut req| async move {
+                        req.set_local_addr(local_addr);
+                        req.set_peer_addr(peer_addr);
+                        Ok(http_types::Response::new(503))
+                    })
+                    .await;
+
+                    if let Err(err) = res {
+                        log::error!("async-h1 error", { error: err.to_string() });
+                    }
+                }
+            })
+            .await;
+
         Ok(())
     }
 
@@ -387,6 +435,7 @@ impl<State: Send + Sync + 'static> Server<State> {
             router,
             state,
             middleware,
+            ..
         } = self.clone();
 
         let method = req.method().to_owned();
@@ -420,6 +469,11 @@ impl<State: Send + Sync + 'static> Server<State> {
             }
         }
     }
+
+    pub fn shutdown(self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl<State> Clone for Server<State> {
@@ -428,6 +482,7 @@ impl<State> Clone for Server<State> {
             router: self.router.clone(),
             state: self.state.clone(),
             middleware: self.middleware.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }

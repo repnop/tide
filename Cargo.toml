@@ -36,6 +36,8 @@ async-h1 = { version = "2.0.1", optional = true }
 async-sse = "3.0.0"
 async-std = { version = "1.6.0", features = ["unstable"] }
 femme = "2.0.1"
+futures-channel = "0.3.5"
+futures-util = "0.3.5"
 http-types = "2.0.1"
 kv-log-macro = "1.0.4"
 route-recognizer = "0.1.13"
